@@ -42,9 +42,12 @@ async fn main() {
     const DATABASE_URL: &str =
         "postgres://forecast:forecast@localhost:5432/forecast?sslmode=disable";
 
-    let Ok(pool) = PgPool::connect(DATABASE_URL).await else {
-        eprintln!("failed to connect to the database");
-        return;
+    let pool = match PgPool::connect(DATABASE_URL).await {
+        Ok(pool) => pool,
+        Err(err) => {
+            eprintln!("failed to connect to the database: {err}");
+            return;
+        }
     };
 
     if let Err(err) = run_migration(&pool).await {
@@ -194,16 +197,15 @@ impl From<sqlx::Error> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        match self {
-            Self::NoResultsFound => (StatusCode::NOT_FOUND, "no results found").into_response(),
-            Self::FetchWeather => {
-                (StatusCode::METHOD_NOT_ALLOWED, "failed to fetch weather").into_response()
+        let (code, payload) = match self {
+            Self::NoResultsFound => (StatusCode::NOT_FOUND, "no results found"),
+            Self::FetchWeather => (StatusCode::METHOD_NOT_ALLOWED, "failed to fetch weather"),
+            Self::Database(err) => {
+                eprintln!("database error: {err}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
             }
-            Self::Database(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("database error: {err}"),
-            )
-                .into_response(),
-        }
+        };
+
+        (code, payload).into_response()
     }
 }
