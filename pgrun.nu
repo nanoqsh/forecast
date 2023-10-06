@@ -1,4 +1,4 @@
-#! /home/nano/.cargo/bin/nu
+#! /usr/bin/nu
 
 mkdir data;
 (

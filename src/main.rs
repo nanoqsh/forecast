@@ -4,7 +4,7 @@ use {
         extract::{FromRequestParts, Query, State},
         headers::{authorization::Basic, Authorization},
         http::{header, request::Parts, StatusCode},
-        response::{IntoResponse, Response},
+        response::{Html, IntoResponse, Response},
         routing, Router, Server, TypedHeader,
     },
     serde::Deserialize,
@@ -51,97 +51,13 @@ impl App {
     }
 }
 
-#[derive(Template)]
-#[template(path = "index.html")]
-struct IndexView;
-
-async fn index() -> IndexView {
-    IndexView
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../templates/index.html"))
 }
 
 #[derive(Deserialize)]
 struct WeatherQuery {
     city: String,
-}
-
-async fn weather(
-    Query(WeatherQuery { city }): Query<WeatherQuery>,
-    State(app): State<App>,
-) -> Result<WeatherView, Error> {
-    let ll = get_lat_long(&app.pool, &city).await?;
-    let weather = fetch_weather(ll).await.ok_or(Error::FetchWeather)?;
-    Ok(WeatherView::new(city, weather))
-}
-
-async fn stats(_: User) -> &'static str {
-    "We're authorized!"
-}
-
-async fn fetch_lat_long(city: &str) -> Option<LatLong> {
-    let endpoint = format!(
-        "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
-        city,
-    );
-
-    let res: GeoResponse = reqwest::get(&endpoint).await.ok()?.json().await.ok()?;
-    res.results.into_iter().next()
-}
-
-async fn get_lat_long(pool: &PgPool, name: &str) -> Result<LatLong, Error> {
-    let ll =
-        sqlx::query_as("SELECT lat AS latitude, long AS longitude FROM cities WHERE name = $1")
-            .bind(name)
-            .fetch_optional(pool)
-            .await?;
-
-    if let Some(ll) = ll {
-        return Ok(ll);
-    }
-
-    let ll = fetch_lat_long(name).await.ok_or(Error::NoResultsFound)?;
-    sqlx::query("INSERT INTO cities (name, lat, long) VALUES ($1, $2, $3)")
-        .bind(name)
-        .bind(ll.latitude)
-        .bind(ll.longitude)
-        .execute(pool)
-        .await?;
-
-    Ok(ll)
-}
-
-async fn fetch_weather(
-    LatLong {
-        latitude,
-        longitude,
-    }: LatLong,
-) -> Option<WeatherResponse> {
-    let endpoint = format!("https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&hourly=temperature_2m");
-    reqwest::get(&endpoint).await.ok()?.json().await.ok()
-}
-
-#[derive(Deserialize)]
-struct GeoResponse {
-    results: Vec<LatLong>,
-}
-
-#[derive(Deserialize, FromRow)]
-struct LatLong {
-    latitude: f64,
-    longitude: f64,
-}
-
-#[derive(Deserialize)]
-struct WeatherResponse {
-    latitude: f64,
-    longitude: f64,
-    timezone: String,
-    hourly: Hourly,
-}
-
-#[derive(Deserialize)]
-struct Hourly {
-    time: Vec<String>,
-    temperature_2m: Vec<f64>,
 }
 
 #[derive(Template)]
@@ -170,6 +86,108 @@ impl WeatherView {
 struct Forecast {
     date: String,
     temperature: f64,
+}
+
+async fn weather(
+    Query(WeatherQuery { city }): Query<WeatherQuery>,
+    State(app): State<App>,
+) -> Result<WeatherView, Error> {
+    let ll = get_lat_long(&app.pool, &city).await?;
+    let weather = fetch_weather(ll).await.ok_or(Error::FetchWeather)?;
+    Ok(WeatherView::new(city, weather))
+}
+
+#[derive(Template)]
+#[template(path = "stats.html")]
+struct StatsView {
+    cities: Vec<City>,
+}
+
+#[derive(FromRow)]
+struct City {
+    name: String,
+}
+
+struct User;
+
+#[async_trait::async_trait]
+impl FromRequestParts<App> for User {
+    type Rejection = Error;
+
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        let auth: TypedHeader<Authorization<Basic>> = TypedHeader::from_request_parts(parts, app)
+            .await
+            .map_err(|_| Error::Unauthorized)?;
+
+        match (auth.username(), auth.password()) {
+            ("forecast", "forecast") => Ok(Self),
+            _ => Err(Error::Unauthorized),
+        }
+    }
+}
+
+async fn stats(_: User, State(app): State<App>) -> Result<StatsView, Error> {
+    let cities = sqlx::query_as("SELECT name FROM cities ORDER BY id DESC LIMIT 10")
+        .fetch_all(&app.pool)
+        .await?;
+
+    Ok(StatsView { cities })
+}
+
+async fn fetch_lat_long(city: &str) -> Option<LatLong> {
+    let endpoint = format!("https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json");
+    let res: GeoResponse = reqwest::get(&endpoint).await.ok()?.json().await.ok()?;
+    res.results.into_iter().next()
+}
+
+async fn get_lat_long(pool: &PgPool, name: &str) -> Result<LatLong, Error> {
+    let ll = sqlx::query_as("SELECT lat, lng FROM cities WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+
+    if let Some(ll) = ll {
+        return Ok(ll);
+    }
+
+    let ll = fetch_lat_long(name).await.ok_or(Error::NoResultsFound)?;
+    sqlx::query("INSERT INTO cities (name, lat, lng) VALUES ($1, $2, $3)")
+        .bind(name)
+        .bind(ll.lat)
+        .bind(ll.lng)
+        .execute(pool)
+        .await?;
+
+    Ok(ll)
+}
+
+async fn fetch_weather(LatLong { lat, lng }: LatLong) -> Option<WeatherResponse> {
+    let endpoint = format!("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&hourly=temperature_2m");
+    reqwest::get(&endpoint).await.ok()?.json().await.ok()
+}
+
+#[derive(Deserialize)]
+struct GeoResponse {
+    results: Vec<LatLong>,
+}
+
+#[derive(Deserialize, FromRow)]
+struct LatLong {
+    #[serde(rename = "latitude")]
+    lat: f64,
+    #[serde(rename = "longitude")]
+    lng: f64,
+}
+
+#[derive(Deserialize)]
+struct WeatherResponse {
+    hourly: Hourly,
+}
+
+#[derive(Deserialize)]
+struct Hourly {
+    time: Vec<String>,
+    temperature_2m: Vec<f64>,
 }
 
 enum Error {
@@ -204,24 +222,6 @@ impl IntoResponse for Error {
                 eprintln!("database error: {err}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
             }
-        }
-    }
-}
-
-struct User;
-
-#[async_trait::async_trait]
-impl FromRequestParts<App> for User {
-    type Rejection = Error;
-
-    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        let auth: TypedHeader<Authorization<Basic>> = TypedHeader::from_request_parts(parts, app)
-            .await
-            .map_err(|_| Error::Unauthorized)?;
-
-        match (auth.username(), auth.password()) {
-            ("forecast", "forecast") => Ok(User),
-            _ => Err(Error::Unauthorized),
         }
     }
 }
