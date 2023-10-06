@@ -1,16 +1,55 @@
 use {
     askama_axum::Template,
     axum::{
-        extract::{rejection::TypedHeaderRejection, FromRequestParts, Query, State},
+        extract::{FromRequestParts, Query, State},
         headers::{authorization::Basic, Authorization},
         http::{header, request::Parts, StatusCode},
         response::{IntoResponse, Response},
         routing, Router, Server, TypedHeader,
     },
     serde::Deserialize,
-    sqlx::{FromRow, PgPool},
+    sqlx::{Executor, FromRow, PgPool},
     std::net::SocketAddr,
 };
+
+#[tokio::main]
+async fn main() {
+    let app = match App::connect().await {
+        Ok(app) => app,
+        Err(err) => {
+            eprintln!("database error: {err}");
+            return;
+        }
+    };
+
+    let router = Router::new()
+        .route("/", routing::get(index))
+        .route("/weather", routing::get(weather))
+        .route("/stats", routing::get(stats))
+        .with_state(app);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let server = Server::bind(&addr);
+    if let Err(err) = server.serve(router.into_make_service()).await {
+        eprintln!("server error: {err}");
+    }
+}
+
+#[derive(Clone)]
+struct App {
+    pool: PgPool,
+}
+
+impl App {
+    async fn connect() -> Result<Self, sqlx::Error> {
+        const DATABASE_URL: &str =
+            "postgres://forecast:forecast@localhost:5432/forecast?sslmode=disable";
+
+        let pool = PgPool::connect(DATABASE_URL).await?;
+        pool.execute(include_str!("../schema.sql")).await?;
+        Ok(Self { pool })
+    }
+}
 
 #[derive(Template)]
 #[template(path = "index.html")]
@@ -36,62 +75,6 @@ async fn weather(
 
 async fn stats(_: User) -> &'static str {
     "We're authorized!"
-}
-
-#[derive(Clone)]
-struct App {
-    pool: PgPool,
-}
-
-#[tokio::main]
-async fn main() {
-    const DATABASE_URL: &str =
-        "postgres://forecast:forecast@localhost:5432/forecast?sslmode=disable";
-
-    let pool = match PgPool::connect(DATABASE_URL).await {
-        Ok(pool) => pool,
-        Err(err) => {
-            eprintln!("failed to connect to the database: {err}");
-            return;
-        }
-    };
-
-    if let Err(err) = run_migration(&pool).await {
-        eprintln!("failed to init database: {err}");
-        return;
-    }
-
-    let app = Router::new()
-        .route("/", routing::get(index))
-        .route("/weather", routing::get(weather))
-        .route("/stats", routing::get(stats))
-        .with_state(App { pool });
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .expect("start server");
-}
-
-async fn run_migration(pool: &PgPool) -> Result<(), sqlx::Error> {
-    const CREATE_CITIES: &str = "
-        CREATE TABLE IF NOT EXISTS cities (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            lat FLOAT8 NOT NULL,
-            long FLOAT8 NOT NULL
-        );
-    ";
-
-    const CREATE_CITIES_INDEX: &str =
-        "CREATE INDEX IF NOT EXISTS cities_name_idx ON cities (name);";
-
-    for sql in [CREATE_CITIES, CREATE_CITIES_INDEX] {
-        sqlx::query(sql).execute(pool).await?;
-    }
-
-    Ok(())
 }
 
 async fn fetch_lat_long(city: &str) -> Option<LatLong> {
