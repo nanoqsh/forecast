@@ -1,10 +1,11 @@
 use {
     askama_axum::Template,
     axum::{
-        extract::{Query, State},
-        http::StatusCode,
+        extract::{rejection::TypedHeaderRejection, FromRequestParts, Query, State},
+        headers::{authorization::Basic, Authorization},
+        http::{header, request::Parts, StatusCode},
         response::{IntoResponse, Response},
-        routing, Router, Server,
+        routing, Router, Server, TypedHeader,
     },
     serde::Deserialize,
     sqlx::{FromRow, PgPool},
@@ -26,15 +27,20 @@ struct WeatherQuery {
 
 async fn weather(
     Query(WeatherQuery { city }): Query<WeatherQuery>,
-    State(pool): State<PgPool>,
+    State(app): State<App>,
 ) -> Result<WeatherView, Error> {
-    let ll = get_lat_long(&pool, &city).await?;
+    let ll = get_lat_long(&app.pool, &city).await?;
     let weather = fetch_weather(ll).await.ok_or(Error::FetchWeather)?;
     Ok(WeatherView::new(city, weather))
 }
 
-async fn stats() -> &'static str {
-    "Stats"
+async fn stats(_: User) -> &'static str {
+    "We're authorized!"
+}
+
+#[derive(Clone)]
+struct App {
+    pool: PgPool,
 }
 
 #[tokio::main]
@@ -59,7 +65,7 @@ async fn main() {
         .route("/", routing::get(index))
         .route("/weather", routing::get(weather))
         .route("/stats", routing::get(stats))
-        .with_state(pool);
+        .with_state(App { pool });
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     Server::bind(&addr)
@@ -186,6 +192,7 @@ struct Forecast {
 enum Error {
     NoResultsFound,
     FetchWeather,
+    Unauthorized,
     Database(sqlx::Error),
 }
 
@@ -197,15 +204,41 @@ impl From<sqlx::Error> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let (code, payload) = match self {
-            Self::NoResultsFound => (StatusCode::NOT_FOUND, "no results found"),
-            Self::FetchWeather => (StatusCode::METHOD_NOT_ALLOWED, "failed to fetch weather"),
+        const AUTH_SCHEME_VALUE: &str = "Basic realm=\"Please enter your credentials\"";
+
+        match self {
+            Self::NoResultsFound => (StatusCode::NOT_FOUND, "no results found").into_response(),
+            Self::FetchWeather => {
+                (StatusCode::METHOD_NOT_ALLOWED, "failed to fetch weather").into_response()
+            }
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, AUTH_SCHEME_VALUE)],
+                "unauthorized",
+            )
+                .into_response(),
             Self::Database(err) => {
                 eprintln!("database error: {err}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
             }
-        };
+        }
+    }
+}
 
-        (code, payload).into_response()
+struct User;
+
+#[async_trait::async_trait]
+impl FromRequestParts<App> for User {
+    type Rejection = Error;
+
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        let auth: TypedHeader<Authorization<Basic>> = TypedHeader::from_request_parts(parts, app)
+            .await
+            .map_err(|_| Error::Unauthorized)?;
+
+        match (auth.username(), auth.password()) {
+            ("forecast", "forecast") => Ok(User),
+            _ => Err(Error::Unauthorized),
+        }
     }
 }
